@@ -16,8 +16,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from edge0.server.chat import (QueueServer, parse_chat_request, sse_format,
-                               decode_tokens)
+from edge0.server.chat import (QueueServer, RequestLimitError, parse_chat_request,
+                               sse_format, decode_tokens)
 
 try:  # pragma: no cover - environment dependent
     from flask import Flask, Response, jsonify, request  # type: ignore
@@ -25,6 +25,9 @@ try:  # pragma: no cover - environment dependent
     _HAS_FLASK = True
 except ImportError:  # pragma: no cover
     _HAS_FLASK = False
+
+# Local hardening: reject oversized POST bodies (see docs/HARDENING.md)
+MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
 
 def _error(status: int, msg: str) -> tuple:
@@ -119,18 +122,21 @@ def build_app_handlers(server: QueueServer):
     """Return a handler dispatch dict shared by both transports."""
 
     def handle_chat(payload: dict):
-        if payload.get("stream"):
-            if _HAS_FLASK:
-                return Response(
-                    _chat_stream(server, payload),
-                    mimetype="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "X-Accel-Buffering": "no",
-                    },
-                )
-            return _chat_stream(server, payload)
-        return _chat_once(server, payload)
+        try:
+            if payload.get("stream"):
+                if _HAS_FLASK:
+                    return Response(
+                        _chat_stream(server, payload),
+                        mimetype="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                return _chat_stream(server, payload)
+            return _chat_once(server, payload)
+        except RequestLimitError as exc:
+            return _error(400, str(exc))
 
     handlers = {
         "GET /healthz": lambda: {"status": "ok", "model": server.model_name},
@@ -167,7 +173,18 @@ def create_app(server: QueueServer):
 
     @app.post("/v1/chat/completions")
     def chat():
-        payload = request.get_json(force=True, silent=True) or {}
+        cl = request.content_length
+        if cl is not None and cl > MAX_BODY_BYTES:
+            return _error(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+        raw = request.get_data(cache=True, as_text=False)
+        if len(raw) > MAX_BODY_BYTES:
+            return _error(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         out = handlers["POST /v1/chat/completions"](payload)
         if isinstance(out, Response):
             return out
@@ -235,12 +252,36 @@ class _StdlibHandler(BaseHTTPRequestHandler):
         if path not in ("/v1/chat/completions", "/v1/completions"):
             self._json(404, {"error": {"message": f"no route {path}"}})
             return
-        length = int(self.headers.get("Content-Length", 0))
-        payload = json.loads(self.rfile.read(length) or b"{}")
-        if path == "/v1/chat/completions" and payload.get("stream"):
-            self._sse(_chat_stream(self.server_q, payload))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._json(400, {"error": {"message": "invalid Content-Length"}})
             return
-        out = handlers[("POST " + path)](payload)
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._json(413, {"error": {
+                "message": f"request body exceeds {MAX_BODY_BYTES} bytes"}})
+            return
+        raw = self.rfile.read(length) if length else b"{}"
+        if len(raw) > MAX_BODY_BYTES:
+            self._json(413, {"error": {
+                "message": f"request body exceeds {MAX_BODY_BYTES} bytes"}})
+            return
+        try:
+            payload = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            self._json(400, {"error": {"message": "invalid JSON body"}})
+            return
+        if not isinstance(payload, dict):
+            self._json(400, {"error": {"message": "JSON body must be an object"}})
+            return
+        try:
+            if path == "/v1/chat/completions" and payload.get("stream"):
+                self._sse(_chat_stream(self.server_q, payload))
+                return
+            out = handlers[("POST " + path)](payload)
+        except RequestLimitError as exc:
+            self._json(400, {"error": {"message": str(exc)}})
+            return
         if isinstance(out, tuple):
             body, status, headers = out
             self.send_response(status)

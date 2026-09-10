@@ -189,13 +189,23 @@ def cmd_serve(args) -> int:
         raise SystemExit(
             "serve requires a checkpoint; pass it as the model argument "
             "(edge0 serve /path/to/model) or --model-dir")
+    host = args.host or "127.0.0.1"
+    # Local hardening: default remains loopback; warn loudly on non-loopback
+    # (unauthenticated API — see docs/HARDENING.md / SECURITY_AUDIT H-03).
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"[edge0] WARNING: binding host={host!r} exposes an "
+            "UNAUTHENTICATED inference API on non-loopback interfaces. "
+            "Prefer 127.0.0.1. See docs/HARDENING.md.",
+            file=sys.stderr,
+        )
     engine = AutoEngine.from_pretrained(model_dir, name=name,
                                         **_engine_kwargs(args))
     server = QueueServer(engine, model_name=name or engine.name)
-    print(f"[edge0] serving {server.model_name} on http://{args.host}:{args.port} "
+    print(f"[edge0] serving {server.model_name} on http://{host}:{args.port} "
           f"(stream={'flask' if args.flask else 'stdlib'})",
           file=sys.stderr)
-    run_server(server, host=args.host, port=args.port, use_flask=args.flask)
+    run_server(server, host=host, port=args.port, use_flask=args.flask)
     return 0
 
 

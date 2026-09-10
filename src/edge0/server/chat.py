@@ -16,6 +16,16 @@ from typing import Any
 
 from edge0.engine.base import Edge0Engine
 
+# Local hardening limits (see docs/HARDENING.md)
+MAX_MESSAGES = 64
+MAX_MESSAGE_CHARS = 32_768  # per message content
+MAX_PROMPT_CHARS = 131_072  # sum of all message contents
+MAX_MAX_TOKENS = 2048  # hard ceiling on client max_tokens
+
+
+class RequestLimitError(ValueError):
+    """Raised when a chat request exceeds local hardening limits."""
+
 
 @dataclass
 class ChatMessage:
@@ -38,21 +48,50 @@ class ChatRequest:
 
 
 def parse_chat_request(payload: dict) -> ChatRequest:
+    raw_messages = payload.get("messages", [])
+    if not isinstance(raw_messages, list):
+        raise RequestLimitError("messages must be a list")
+    if len(raw_messages) > MAX_MESSAGES:
+        raise RequestLimitError(
+            f"too many messages ({len(raw_messages)} > {MAX_MESSAGES})")
     msgs = []
-    for m in payload.get("messages", []):
+    total_chars = 0
+    for m in raw_messages:
+        if not isinstance(m, dict):
+            raise RequestLimitError("each message must be an object")
         role = str(m.get("role", "user"))
         content = m.get("content", "")
         if isinstance(content, list):  # multi-part content: join text parts
             content = "".join(
                 p.get("text", "") for p in content if isinstance(p, dict))
-        msgs.append(ChatMessage(role=role, content=str(content)))
+        content_s = str(content)
+        if len(content_s) > MAX_MESSAGE_CHARS:
+            raise RequestLimitError(
+                f"message content exceeds {MAX_MESSAGE_CHARS} characters")
+        total_chars += len(content_s)
+        if total_chars > MAX_PROMPT_CHARS:
+            raise RequestLimitError(
+                f"total prompt exceeds {MAX_PROMPT_CHARS} characters")
+        msgs.append(ChatMessage(role=role, content=content_s))
+
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is not None:
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            raise RequestLimitError("max_tokens must be an integer")
+        if max_tokens < 1:
+            raise RequestLimitError("max_tokens must be >= 1")
+        if max_tokens > MAX_MAX_TOKENS:
+            max_tokens = MAX_MAX_TOKENS
+
     return ChatRequest(
         model=str(payload.get("model", "")),
         messages=msgs,
         temperature=payload.get("temperature"),
         top_p=payload.get("top_p"),
         top_k=payload.get("top_k"),
-        max_tokens=payload.get("max_tokens"),
+        max_tokens=max_tokens,
         seed=payload.get("seed"),
         stream=bool(payload.get("stream", False)),
         enable_thinking=payload.get("enable_thinking"),
