@@ -8,30 +8,35 @@ streaming), and the /v1/completions rejection path.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
-import time
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from urllib import request as urlrequest
+from urllib.error import HTTPError
 
 import pytest
 
 from edge0.config import GenerationConfig
 from edge0.server.app import (
+    MAX_BODY_BYTES,
     _HAS_FLASK,
     _chat_once,
     _chat_stream,
     _StdlibHandler,
     build_app_handlers,
     create_app,
-    run_stdlib,
 )
 from edge0.server.chat import (
-    ChatMessage,
+    MAX_MAX_TOKENS,
+    MAX_MESSAGE_CHARS,
+    MAX_MESSAGES,
+    MAX_PROMPT_CHARS,
     ChatRequest,
     ChatSession,
     QueueServer,
+    RequestLimitError,
     decode_tokens,
     parse_chat_request,
     sse_format,
@@ -57,24 +62,37 @@ class FakeTok:
         return text
 
     def encode(self, text):
+        self.last_text = text
         return self.ids
 
     def decode(self, tokens):
         return "".join(f"T{t}" for t in tokens)
 
 
-class PlainTok(FakeTok):
-    """Tokenizer without apply_chat_template (stdlib fallback path).
+class PlainTok:
+    """Tokenizer without apply_chat_template (plain-text fallback path)."""
 
-    Deleting the method (vs raising) keeps hasattr() False so the
-    server's plain-text fallback renders instead."""
+    bos_token_id = 0
 
-    def __init__(self):
-        super().__init__()
-        try:
-            del self.apply_chat_template
-        except AttributeError:
-            pass
+    def __init__(self, ids=(7, 8, 9)):
+        self.ids = list(ids)
+
+    def encode(self, text):
+        self.last_text = text
+        return self.ids
+
+    def decode(self, tokens):
+        return "".join(f"T{t}" for t in tokens)
+
+
+class NoThinkKwargTok(FakeTok):
+    """Template that rejects the enable_thinking kwarg (TypeError path)."""
+
+    def apply_chat_template(self, messages, tokenize=False,
+                            add_generation_prompt=True):
+        return FakeTok.apply_chat_template(
+            self, messages, tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt)
 
 
 class FakeEngine:
@@ -147,6 +165,55 @@ def test_parse_stream_flag_and_sampling():
     assert req.stream is True
 
 
+def test_parse_rejects_non_list_messages():
+    with pytest.raises(RequestLimitError, match="must be a list"):
+        parse_chat_request({"messages": "nope"})
+
+
+def test_parse_rejects_too_many_messages():
+    msgs = [{"role": "user", "content": "x"}] * (MAX_MESSAGES + 1)
+    with pytest.raises(RequestLimitError, match="too many messages"):
+        parse_chat_request({"messages": msgs})
+
+
+def test_parse_rejects_oversize_message():
+    with pytest.raises(RequestLimitError, match="message content exceeds"):
+        parse_chat_request({"messages": [{
+            "role": "user", "content": "a" * (MAX_MESSAGE_CHARS + 1),
+        }]})
+
+
+def test_parse_rejects_oversize_prompt():
+    n = 8
+    chunk = "a" * (MAX_PROMPT_CHARS // n + 1)
+    assert len(chunk) <= MAX_MESSAGE_CHARS
+    with pytest.raises(RequestLimitError, match="total prompt exceeds"):
+        parse_chat_request({"messages": [
+            {"role": "user", "content": chunk} for _ in range(n)
+        ]})
+
+
+def test_parse_clamps_max_tokens():
+    req = parse_chat_request({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": MAX_MAX_TOKENS + 100,
+    })
+    assert req.max_tokens == MAX_MAX_TOKENS
+
+
+def test_parse_rejects_bad_max_tokens():
+    with pytest.raises(RequestLimitError, match="integer"):
+        parse_chat_request({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": "nope",
+        })
+    with pytest.raises(RequestLimitError, match=">= 1"):
+        parse_chat_request({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 0,
+        })
+
+
 # ---- sse / decode ---------------------------------------------------------
 
 
@@ -172,9 +239,8 @@ def test_chat_session_prompt_ids_uses_template():
     sess = ChatSession(eng, _req())
     ids = sess.prompt_ids()
     assert ids == [7, 8, 9]
-    # The template was called with enable_thinking=False (serve.py parity).
-    text = eng._tok.apply_chat_template([{"role": "user", "content": "hi"}])
-    assert "<|im_start|>assistant" in text
+    assert eng._tok.last_text.startswith("<tpl>")
+    assert "<|im_start|>assistant" in eng._tok.last_text
 
 
 def test_chat_session_prompt_ids_fallback_text():
@@ -182,6 +248,14 @@ def test_chat_session_prompt_ids_fallback_text():
     sess = ChatSession(eng, _req())
     ids = sess.prompt_ids()
     assert ids == [7, 8, 9]
+    assert eng._tok.last_text.startswith("<|im_start|>user\nhi")
+
+
+def test_chat_session_template_without_enable_thinking_kwarg():
+    eng = FakeEngine(tok=NoThinkKwargTok())
+    sess = ChatSession(eng, _req())
+    sess.prompt_ids()
+    assert eng._tok.last_text.startswith("<tpl>")
 
 
 def test_chat_session_fallback_text_format():
@@ -260,8 +334,10 @@ def test_handlers_healthz_and_models():
 def test_handlers_completions_rejected():
     srv = QueueServer(FakeEngine())
     handlers = build_app_handlers(srv)
-    body, status = handlers["POST /v1/completions"]({})
+    body, status, headers = handlers["POST /v1/completions"]({})
     assert status == 400
+    assert "not supported" in body
+    assert headers["Content-Type"] == "application/json"
 
 
 def test_chat_once_response_shape():
@@ -436,3 +512,191 @@ def test_flask_http_streams_before_generation_finishes():
         eng.resume.set()
         response.close()
     assert b"data: [DONE]\n\n" in body
+
+
+# ---- request-limit HTTP contract ------------------------------------------
+
+
+class _StdlibServer:
+    def __init__(self, engine=None):
+        self.engine = engine or FakeEngine()
+        srv = QueueServer(self.engine, model_name="fake")
+        handler = type("Edge0Handler", (_StdlibHandler,), {"server_q": srv})
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+def _too_many_messages_payload(**extra):
+    return json.dumps({
+        "model": "fake",
+        "messages": [{"role": "user", "content": "x"}] * (MAX_MESSAGES + 1),
+        **extra,
+    }).encode("utf-8")
+
+
+def test_stdlib_chat_limit_error_is_400():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/chat/completions",
+            data=_too_many_messages_payload(),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        body = json.loads(exc.value.read())
+        assert "too many messages" in body["error"]["message"]
+
+
+def test_stdlib_stream_limit_error_is_400_not_sse():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/chat/completions",
+            data=_too_many_messages_payload(stream=True),
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        assert "text/event-stream" not in (exc.value.headers.get("Content-Type") or "")
+        body = json.loads(exc.value.read())
+        assert "too many messages" in body["error"]["message"]
+
+
+def test_stdlib_invalid_json_is_400():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/chat/completions",
+            data=b"not-json",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+
+
+def test_stdlib_non_object_json_is_400():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/chat/completions",
+            data=b"[]",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+
+
+def test_stdlib_invalid_utf8_is_400():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/chat/completions",
+            data=b"\xff\xfe{}",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+
+
+def test_stdlib_completions_rejected_over_http():
+    with _StdlibServer() as ctx:
+        req = urlrequest.Request(
+            f"{ctx.base}/v1/completions",
+            data=b'{"prompt": "hi"}',
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlrequest.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+
+
+def test_stdlib_oversize_content_length_is_413():
+    with _StdlibServer() as ctx:
+        conn = http.client.HTTPConnection("127.0.0.1", ctx.port, timeout=10)
+        try:
+            conn.putrequest("POST", "/v1/chat/completions")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(MAX_BODY_BYTES + 1))
+            conn.endheaders()
+            conn.send(b"{}")
+            resp = conn.getresponse()
+            assert resp.status == 413
+        finally:
+            conn.close()
+
+
+@pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+def test_flask_chat_limit_error_is_400():
+    app = create_app(QueueServer(FakeEngine(), model_name="fake"))
+    r = app.test_client().post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "messages": [{"role": "user", "content": "x"}] * (MAX_MESSAGES + 1),
+        },
+    )
+    assert r.status_code == 400
+    assert "too many messages" in r.get_json()["error"]["message"]
+
+
+@pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+def test_flask_stream_limit_error_is_400_not_sse():
+    app = create_app(QueueServer(FakeEngine(), model_name="fake"))
+    r = app.test_client().post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake",
+            "messages": [{"role": "user", "content": "x"}] * (MAX_MESSAGES + 1),
+            "stream": True,
+        },
+    )
+    assert r.status_code == 400
+    assert "event-stream" not in (r.headers.get("Content-Type") or "")
+    assert "too many messages" in r.get_json()["error"]["message"]
+
+
+@pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+def test_flask_invalid_json_is_400():
+    app = create_app(QueueServer(FakeEngine(), model_name="fake"))
+    r = app.test_client().post(
+        "/v1/chat/completions",
+        data=b"not-json",
+        content_type="application/json",
+    )
+    assert r.status_code == 400
+    assert r.get_json()["error"]["message"] == "invalid JSON body"
+
+
+@pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+def test_flask_non_object_json_is_400():
+    app = create_app(QueueServer(FakeEngine(), model_name="fake"))
+    r = app.test_client().post(
+        "/v1/chat/completions",
+        data=b"[]",
+        content_type="application/json",
+    )
+    assert r.status_code == 400
+    assert "object" in r.get_json()["error"]["message"]
+
+
+@pytest.mark.skipif(not _HAS_FLASK, reason="flask is not installed")
+def test_flask_oversize_body_is_413():
+    app = create_app(QueueServer(FakeEngine(), model_name="fake"))
+    r = app.test_client().post(
+        "/v1/chat/completions",
+        data=b"x" * (MAX_BODY_BYTES + 1),
+        content_type="application/json",
+    )
+    assert r.status_code == 413

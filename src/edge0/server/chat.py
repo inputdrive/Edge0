@@ -140,8 +140,8 @@ class ChatSession:
                 text = tok.apply_chat_template(
                     [m.__dict__ for m in self.req.messages],
                     tokenize=False, add_generation_prompt=True)
-            else:
-                text = self._chat_text()
+        else:
+            text = self._chat_text()
         ids = tok.encode(text)
         if not ids:
             ids = [tok.bos_token_id or 0]

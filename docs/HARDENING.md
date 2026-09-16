@@ -1,6 +1,6 @@
 # Edge0 local hardening notes
 
-Local clone: `/Users/first/github/edge0` (private; not for upstream PR).
+Local clone (private; not for upstream PR).
 Date: 2026-09-10 (America/New_York).
 
 This document records **local** mitigations and **documented-only** residual risks from `docs/SECURITY_AUDIT.md`.
@@ -41,4 +41,4 @@ Defined in `src/edge0/server/chat.py` and `src/edge0/server/app.py`:
 ## Related
 
 - Full findings: `docs/SECURITY_AUDIT.md`
-- Consumer wrapper: `/Users/first/github/local-fallback-agent` (`bin/ask`, `bin/serve-edge0`)
+- Consumer wrapper: `local-fallback-agent` (`bin/ask`, `bin/serve-edge0`)

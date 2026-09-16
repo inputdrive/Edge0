@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Scope | Local clone `/Users/first/github/edge0` of `https://github.com/Edge0-AI/edge0` |
+| Scope | Local clone of `https://github.com/Edge0-AI/edge0` |
 | Commit | `0700e6532f45e0d0d99e9c588d7d8cd240538ea0` (`0700e65`) |
 | Date | 2026-09-10 (America/New_York) |
 | Auditor | Automated security audit (source review only) |
