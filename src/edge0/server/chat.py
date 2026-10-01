@@ -18,8 +18,8 @@ from edge0.engine.base import Edge0Engine
 
 # Local hardening limits (see docs/HARDENING.md)
 MAX_MESSAGES = 64
-MAX_MESSAGE_CHARS = 32_768  # per message content
-MAX_PROMPT_CHARS = 131_072  # sum of all message contents
+MAX_MESSAGE_CHARS = 524_288  # per message content (Hermes system+tools)
+MAX_PROMPT_CHARS = 524_288  # sum of all message contents
 MAX_MAX_TOKENS = 2048  # hard ceiling on client max_tokens
 
 

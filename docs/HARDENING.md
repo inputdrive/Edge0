@@ -17,7 +17,7 @@ This document records **local** mitigations and **documented-only** residual ris
 | Area | Change |
 | --- | --- |
 | Bind / H-03 | CLI default remains `127.0.0.1`; non-loopback `--host` prints a loud stderr warning. Wrapper `serve-edge0` hard-allowlists loopback. |
-| Resource limits / H-02 | OpenAI-compatible API enforces: max POST body **1 MiB**; max **64** messages; max **32 768** chars per message; max **131 072** total prompt chars; `max_tokens` clamped to **≤ 2048**. |
+| Resource limits / H-02 | OpenAI-compatible API enforces: max POST body **4 MiB**; max **64** messages; max **524 288** chars per message and total prompt; `max_tokens` clamped to **≤ 2048**. |
 | C-01 (auth) | **Local mitigation only via localhost bind** — no bearer auth added. Network exposure still means full unauthenticated inference. |
 
 ## Documented only (out of scope this pass)
@@ -32,10 +32,10 @@ This document records **local** mitigations and **documented-only** residual ris
 
 Defined in `src/edge0/server/chat.py` and `src/edge0/server/app.py`:
 
-- `MAX_BODY_BYTES = 1_048_576`
+- `MAX_BODY_BYTES = 4_194_304`
 - `MAX_MESSAGES = 64`
-- `MAX_MESSAGE_CHARS = 32_768`
-- `MAX_PROMPT_CHARS = 131_072`
+- `MAX_MESSAGE_CHARS = 524_288`
+- `MAX_PROMPT_CHARS = 524_288`
 - `MAX_MAX_TOKENS = 2048`
 
 ## Related

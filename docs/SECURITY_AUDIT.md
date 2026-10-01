@@ -306,7 +306,7 @@ Private local hardening only — **do not PR upstream** from this pass.
 | **C-01** | **Local mitigation** | No auth added. Mitigated by keeping bind on `127.0.0.1` (CLI default + wrapper enforce + non-loopback warning). Documented in `docs/HARDENING.md`. |
 | **C-02** | **Documented only** | Jinja sandbox **not** implemented. Mitigate by loading only known-good Edge0 HF checkpoints. |
 | **H-01** | **Documented only** | `trust_remote_code` **not** flipped. Mitigate via known-good checkpoints only. |
-| **H-02** | **Local mitigation** | Request limits: max body 1 MiB; max messages/prompt chars; `max_tokens` hard ceiling 2048 (`server/chat.py`, `server/app.py`). |
+| **H-02** | **Local mitigation** | Request limits: max body 4 MiB; max messages/prompt chars; `max_tokens` hard ceiling 2048 (`server/chat.py`, `server/app.py`). |
 | **H-03** | **Local mitigation** | Default `127.0.0.1`; loud warning on non-loopback; `local-fallback-agent/bin/serve-edge0` forces loopback. |
 | **H-04** | **Deferred** | Yanked `mlx-lm==0.31.0` not upgraded in this pass (not trivial/safe without revalidation). |
 | Other M/L/I | **Deferred / documented** | See original findings; not in Greg’s local-hardening scope this pass. |

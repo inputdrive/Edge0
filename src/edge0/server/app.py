@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
     _HAS_FLASK = False
 
 # Local hardening: reject oversized POST bodies (see docs/HARDENING.md)
-MAX_BODY_BYTES = 1_048_576  # 1 MiB
+MAX_BODY_BYTES = 4_194_304  # 4 MiB (Hermes agent prompts + tool schemas)
 
 
 def _error(status: int, msg: str) -> tuple:
